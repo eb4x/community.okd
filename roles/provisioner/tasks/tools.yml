@@ -1,0 +1,98 @@
+---
+- name: get latest official openshift-tools
+  environment: "{{ hostvars[inventory_hostname].environment | default({}) }}"
+  get_url:
+    url: "{{ tool.url | default('https://mirror.openshift.com/pub/openshift-v4/clients/ocp/' ~ ocp_version ~ '/' ~ tool.name ~ '.tar.gz') }}"
+    checksum: "{{ tool.checksum | default('sha256:https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/' ~ ocp_version ~ '/sha256sum.txt') }}"
+    dest: "{{ tool.dest | default('~/' ~ tool.name ~ '.tar.gz') }}"
+    mode: "{{ tool.mode | default('0644') }}"
+  loop:
+    - name: "openshift-client-linux-{{ ocp_version }}"
+    - name: opm
+      url: https://github.com/operator-framework/operator-registry/releases/download/v1.28.0/linux-amd64-opm
+      checksum: sha256:https://github.com/operator-framework/operator-registry/releases/download/v1.28.0/checksums.txt
+      dest: ~/.local/bin/opm
+      mode: '0755'
+    - name: operator-sdk
+      url: https://github.com/operator-framework/operator-sdk/releases/download/v1.31.0/operator-sdk_linux_amd64
+      checksum: sha256:https://github.com/operator-framework/operator-sdk/releases/download/v1.31.0/checksums.txt
+      dest: ~/.local/bin/operator-sdk
+      mode: '0755'
+    - name: oc-mirror
+  loop_control:
+    loop_var: tool
+    label: "{{ tool.name }}"
+
+- name: install latest openshift-tools to .local/bin
+  unarchive:
+    src: "~/{{ item.src }}.tar.gz"
+    remote_src: true
+    dest: "~/.local/bin"
+    exclude:
+      - README.md
+    creates: "{{ item.creates | default(omit) }}"
+  loop:
+    - src: "openshift-client-linux-{{ ocp_version }}"
+      creates: "~/.local/bin/oc"
+    - src: oc-mirror
+
+- name: get openshift client/installer for {{ release_version }}
+  environment: "{{ hostvars[inventory_hostname].environment | default({}) }}"
+  command:
+    cmd: "oc adm release extract --to /tmp --tools {{ release_pull }}"
+    creates: "/tmp/openshift-client-linux-{{ release_version }}.tar.gz"
+
+- name: update openshift client/installer to {{ release_version }}
+  unarchive:
+    src: "/tmp/{{ item }}"
+    remote_src: true
+    dest: "~/.local/bin"
+    exclude:
+      - README.md
+  loop:
+    - "openshift-client-linux-{{ release_version }}.tar.gz"
+    - "openshift-install-linux-{{ release_version }}.tar.gz"
+
+- name: get openshift-baremetal-install for {{ release_version }}
+  environment: "{{ hostvars[inventory_hostname].environment | default({}) }}"
+  command:
+    cmd: >-
+      oc adm release extract --command=openshift-baremetal-install
+      --to ~/.local/bin {{ release_pull }}
+  tags:
+    - baremetal
+
+# oc-mirror is archived non-executable
+- name: make sure tools are executable
+  file:
+    path: "~/.local/bin/{{ item }}"
+    mode: '0755'
+  loop:
+    - oc
+    - oc-mirror
+    - openshift-install
+    - openshift-baremetal-install
+    - opm
+
+- name: get bash-completion script for openshift commands
+  command:
+    cmd: "{{ command }} completion bash"
+  changed_when: false
+  loop:
+    - oc
+    - oc-mirror
+    - openshift-install
+    - openshift-baremetal-install
+    - opm
+  loop_control:
+    loop_var: command
+  register: _command_completion
+
+- name: save bash-completion scripts for openshift commands
+  copy:
+    content: "{{ item.stdout }}"
+    dest: "~/.local/share/bash-completion/completions/{{ item.command }}"
+    mode: '0644'
+  loop: "{{ _command_completion.results }}"
+  loop_control:
+    label: "{{ item.command }}"

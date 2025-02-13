@@ -1,0 +1,86 @@
+---
+coreos_image_cache_directory: "/home/{{ ansible_user | default(ansible_facts.user_id) }}/.cache/openshift-installer/image_cache"
+installation_directory: "~/clusterconfigs"
+
+ansible_package_requirements:
+  - nmstate
+  - python3-libnmstate
+  - tar
+okd_package_requirements:
+  - libvirt
+  - qemu-kvm
+  - mkisofs
+  - python3-devel
+  - jq
+  - ipmitool
+
+baremetal_network_ipv4_cidr: "10.0.0.0/24"
+baremetal_network_ipv6_cidr: "fd00::/64"
+enable_ipv6: false
+
+# variants: [ ocp, fcos, scos ]
+release_variant: scos
+
+_release_image_repo:
+  ocp: openshift-release-dev/ocp-release
+  fcos: openshift/okd
+  scos: okd/scos-release
+
+_release_content_repo:
+  ocp: openshift-release-dev/ocp-v4.0-art-dev
+  fcos: openshift/okd-content
+  scos: okd/scos-content
+
+release_registry: quay.io
+release_image_repo: "{{ _release_image_repo[release_variant] }}"
+release_content_repo: "{{ _release_content_repo[release_variant] }}"
+release_pull: "{{ release_registry }}/{{ release_image_repo }}:{{ release_version }}"
+
+use_mirror_registry: true
+
+image_mirror_sets:
+  - source: public.ecr.aws
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/public.ecr.aws"
+  - source: docker.elastic.co
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/docker.elastic.co"
+  - source: registry.access.redhat.com
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/registry.access.redhat.com"
+  - source: docker.io/library
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/docker.io/library"
+  - source: docker.io
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/docker.io"
+  - source: gcr.io
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/gcr.io"
+  - source: ghcr.io
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/ghcr.io"
+  # 2023-03-20 k8s.gcr.io => registry.k8s.io
+  - source: k8s.gcr.io
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/registry.k8s.io"
+  - source: registry.k8s.io
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/registry.k8s.io"
+  - source: quay.io
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/quay.io"
+  - source: registry.redhat.io
+    mirrorSourcePolicy: NeverContactSource
+    mirrors:
+    - "{{ mirror_registry_fqdn }}:8443/mirrors/registry.redhat.io"

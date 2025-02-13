@@ -1,0 +1,102 @@
+---
+# https://docs.okd.io/latest/installing/installing_bare_metal_ipi/ipi-install-installation-workflow.html
+- name: install packages
+  package:
+    name: "{{ ansible_package_requirements +
+              okd_package_requirements }}"
+  become: true
+
+# TODO: EL9 (almalinux) removes /var/run/libvirt/libvirt-sock when
+# "not in use" under /usr/lib/systemd/system/libvirtd.socket
+#- block:
+#    - stat:
+#        path: /var/run/libvirt/libvirt-sock
+#      register: _stat_libvirt_sock
+#    - debug:
+#        var: _stat_libvirt_sock
+#
+#    - name: disable the systemd.socket
+#      ansible.builtin.systemd:
+#        name: libvirtd.socket
+#        enabled: false
+#        state: stopped
+#        masked: false
+#      become: true
+#      register: _libvirtd_socket
+#
+#    - name: enable libvirt
+#      ansible.builtin.systemd:
+#        name: libvirtd
+#        enabled: true
+#        state: "{{ (_libvirtd_socket is changed) | ternary('restarted', 'started') }}"
+#      become: true
+#  tags:
+#    - libvirt
+
+# FIXME: this currently breaks the network, maybe look into nmstate?
+#- import_tasks: network.yml
+
+- name: import_tasks doesn't display the name section
+  import_tasks: user.yml
+- name: import_tasks doesn't display the name section
+  import_tasks: get-release-version.yml
+- name: import_tasks doesn't display the name section
+  import_tasks: tools.yml
+  tags:
+    - tools
+
+- name: set openshift_install_version
+  block:
+    - name: get openshift-install version
+      command: openshift-install version
+      changed_when: false
+      register: _cmd_openshift_install_version
+    - name: set _openshift_install_version
+      set_fact:
+        _openshift_install_version: "{{ _cmd_openshift_install_version.stdout | regex_search('openshift-install (?P<version>\\d+\\.\\d+)\\.', '\\g<version>') | first }}"
+  tags:
+    - config
+    - install-config.yaml
+
+- name: "push {{ release_variant }}:{{ release_version }} to mirror-registry"
+  when: use_mirror_registry
+  environment: "{{ hostvars[inventory_hostname].environment | default({}) }}"
+  block:
+    - name: create ocp registry login
+      when: release_variant == 'ocp'
+      containers.podman.podman_login:
+        authfile: "{{ mirror_registry_authfile }}"
+        username: "{{ ocp_credentials.auths[registry].auth | b64decode | split(':') | first }}"
+        password: "{{ ocp_credentials.auths[registry].auth | b64decode | split(':') | last }}"
+        registry: "{{ registry }}"
+      vars:
+        ocp_credentials: "{{ lookup('file', 'pull-secret-ocp.json') | from_json }}"
+      loop:
+        - quay.io
+      loop_control:
+        loop_var: registry
+
+    - name: check for release tag
+      command: "skopeo inspect docker://{{ mirror_registry_fqdn }}:8443/mirrors/{{ release_registry }}/{{ release_image_repo }}:{{ release_version }}"
+      changed_when: false
+
+  rescue:
+    - name: mirror {{ release_variant }}:{{ release_version }}
+      command: >-
+        oc adm release mirror -a {{ mirror_registry_authfile }}
+          --from={{ release_pull }}
+          --to={{ mirror_registry_fqdn }}:8443/mirrors/{{ release_registry }}/{{ release_content_repo }}
+          --to-release-image={{ mirror_registry_fqdn }}:8443/mirrors/{{ release_registry }}/{{ release_image_repo }}:{{ release_version }}
+          {% if _openshift_install_version is version('4.13', '>=') %} --print-mirror-instructions=idms{% endif %}
+          --keep-manifest-list=true
+          --insecure
+      register: _oc_adm_release_mirror
+  always:
+    - name: take a big release-mirror dump on the screen
+      when: _oc_adm_release_mirror is defined
+      debug:
+        msg: "{{ _oc_adm_release_mirror[item].split('\n') }}"
+      loop: [stderr, stdout]
+
+- name: import_tasks doesn't display the name section
+  import_tasks: install.yml

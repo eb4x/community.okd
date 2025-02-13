@@ -1,0 +1,121 @@
+---
+apiVersion: v1
+{% if openshift_install_version is version('4.11', '>=') %}
+capabilities:
+  baselineCapabilitySet: None
+  additionalEnabledCapabilities:
+    - baremetal
+    #- openshift-samples
+    - MachineAPI
+    - marketplace
+{%   if openshift_install_version is version('4.12', '>=') %}
+    - Console
+    - Insights
+    - Storage
+    - CSISnapshot
+{%   endif %}
+{%   if openshift_install_version is version('4.13', '>=') %}
+    - NodeTuning
+{%   endif %}
+{%   if openshift_install_version is version('4.14', '>=') %}
+    - Build
+    #- DeploymentConfig
+    - ImageRegistry
+{%   endif %}
+{%   if openshift_install_version is version('4.15', '>=') %}
+    - OperatorLifecycleManager
+    #- CloudCredential
+{%   endif %}
+{%   if openshift_install_version is version('4.16', '>=') %}
+    - Ingress
+    #- CloudControllerManager
+{%   endif %}
+{% endif %}
+baseDomain: {{ base_domain }}
+metadata:
+  name: {{ cluster_name }}
+networking:
+  networkType: OVNKubernetes
+  machineNetwork:
+  - cidr: {{ baremetal_network_ipv4_cidr }}
+{%   if enable_ipv6 %}
+  - cidr: {{ baremetal_network_ipv6_cidr }}
+{%   endif %}
+  clusterNetwork:
+  - cidr: 10.128.0.0/14
+    hostPrefix: 20
+{%   if enable_ipv6 %}
+  - cidr: fd00:10:128::/56
+    hostPrefix: 64
+  serviceNetwork:
+  - 172.30.0.0/16
+  - fd00:172:30::/112
+{%   endif %}
+compute:
+- name: worker
+  architecture: amd64
+  replicas: 0
+controlPlane:
+  name: master
+  platform:
+    baremetal: {}
+  architecture: amd64
+  replicas: 3
+platform:
+  baremetal:
+{% if bootstrap_os_image is defined %}
+    bootstrapOSImage: "{{ bootstrap_os_image }}"
+{% endif %}
+    apiVIPs:
+    - {{ baremetal_network_ipv4_cidr | ansible.utils.ipaddr('127') | ansible.utils.ipaddr('address') }}
+{%   if enable_ipv6 %}
+    - {{ baremetal_network_ipv6_cidr | ansible.utils.ipaddr('295') | ansible.utils.ipaddr('address') }}
+{%   endif %}
+    ingressVIPs:
+    - {{ baremetal_network_ipv4_cidr | ansible.utils.ipaddr('128') | ansible.utils.ipaddr('address') }}
+{%   if enable_ipv6 %}
+    - {{ baremetal_network_ipv6_cidr | ansible.utils.ipaddr('296') | ansible.utils.ipaddr('address') }}
+{%   endif %}
+    provisioningBridge: {{ provisioningBridge | default('provisioning') }}
+    provisioningDHCPRange: 172.22.0.64,172.22.0.95
+    externalBridge: {{ externalBridge | default('baremetal') }}
+    hosts:
+{% for host in groups[master_group] %}
+    - name: master-{{ loop.index0 }}
+      role: master
+      bmc:
+        username: {{ hostvars[host].bmc.username }}
+        password: {{ hostvars[host].bmc.password }}
+        address: {{ hostvars[host].bmc.address }}
+      bootMACAddress: {{ hostvars[host].bootMACAddress }}
+      bootMode: {{ hostvars[host].bootMode }}
+      {# https://docs.openshift.com/container-platform/4.15/installing/installing_bare_metal_ipi/ipi-install-installation-workflow.html#root-device-hints_ipi-install-installation-workflow #}
+      {# hctl: ls -l /sys/block/*/device/scsi_device #}
+      {# wwn: ls -l /dev/disk/by-id/wwn-*            +#}
+      rootDeviceHints:
+        {{ hostvars[host].rootDeviceHints | to_nice_yaml }}
+{%   if experimental_networking | default(false) %}
+      provisioningNetworkInterface: bond0
+      networkConfig:
+        {{ lookup('template', 'nmstate.yaml.j2', template_vars={ 'bootMACAddress': hostvars[host].bootMACAddress }) | from_yaml | to_nice_yaml(2) | indent(8) }}
+{%   endif %}
+{% endfor %}
+pullSecret: {{ pullSecret | default(lookup('file', 'pull-secret-okd.json') | to_nice_json) }}
+{% if use_mirror_registry %}
+{%   if _mirror_registry_is_self_signed %}
+additionalTrustBundle: |
+  {{ mirror_registry_ca | indent(2) }}
+{%   endif %}
+{%   if openshift_install_version is version('4.13', '>=') %}
+imageDigestSources:
+{%   else %}
+imageContentSources:
+{%   endif %}
+- source: {{ release_registry }}/{{ release_image_repo }}
+  mirrors:
+  - {{ mirror_registry_fqdn }}:8443/mirrors/{{ release_registry }}/{{ release_image_repo }}
+- source: {{ release_registry }}/{{ release_content_repo }}
+  mirrors:
+  - {{ mirror_registry_fqdn }}:8443/mirrors/{{ release_registry }}/{{ release_content_repo }}
+{% endif %}
+sshKey: {{ ssh_key }}

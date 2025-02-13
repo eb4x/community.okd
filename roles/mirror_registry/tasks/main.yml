@@ -1,0 +1,177 @@
+---
+# https://github.com/quay/mirror-registry
+# https://docs.okd.io/latest/installing/disconnected_install/installing-mirroring-creating-registry.html
+# https://docs.okd.io/latest/installing/disconnected_install/installing-mirroring-installation-images.html#installation-mirror-repository_installing-mirroring-installation-images
+
+# export REGISTRY_AUTH_FILE=$HOME/.config/containers/auth.json
+
+- name: install podman/skopeo
+  package:
+    name:
+      - podman
+      - skopeo
+  become: true
+
+- name: create directories
+  file:
+    state: directory
+    path: "{{ item }}"
+    mode: '0755'
+  loop:
+    - "~/.config/containers"
+    - "~/.config/containers/certs.d/{{ mirror_registry_fqdn }}:8443"
+    - "{{ mirror_registry_quayroot }}"
+
+- name: check for existing mirror-registry
+  stat:
+    path: ~/.ssh/quay_installer
+  register: _quay_installer
+
+- name: get mirror-registry version {{ mirror_registry_version }}
+  environment: "{{ hostvars[inventory_hostname].environment | default({}) }}"
+  get_url:
+    url: "https://github.com/quay/mirror-registry/releases/download/{{ mirror_registry_version }}/mirror-registry-offline.tar.gz"
+    checksum: "{{ mirror_registry_checksum }}"
+    dest: "~/mirror-registry/mirror-registry.tar.gz"
+    mode: '0644'
+  register: _mirror_registry_download
+
+- name: extract mirror-registry
+  unarchive:
+    src: "~/mirror-registry/mirror-registry.tar.gz"
+    remote_src: true
+    dest: "~/mirror-registry"
+    creates: "{{ _mirror_registry_download is changed | ternary(omit, '~/mirror-registry/mirror-registry') }}"
+
+- name: dump ssl certs
+  when: not _mirror_registry_is_self_signed
+  copy:
+    content: "{{ item.content }}"
+    dest: "~/mirror-registry/{{ mirror_registry_fqdn | replace('.', '_') }}.{{ item.ext }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - content: "{{ (mirror_registry_ssl_key | trim) ~ '\n' }}"
+      ext: key
+      mode: '0600'
+    - content: "{{ (mirror_registry_ssl_crt | trim) ~ '\n' }}"
+      ext: crt
+      mode: '0644'
+  loop_control:
+    label: "{{ mirror_registry_fqdn | replace('.', '_') }}.{{ item.ext }}"
+
+- name: mirror-registry install {{ mirror_registry_fqdn }}
+  when:
+    - not _quay_installer.stat.exists
+  command: 
+    chdir: "~/mirror-registry"
+    cmd: >-
+      ./mirror-registry install
+      --initUser {{ mirror_registry_user }}
+      --initPassword {{ mirror_registry_password }}
+      --quayHostname {{ mirror_registry_fqdn }}
+      --quayRoot {{ mirror_registry_quayroot }}
+      {% if not _mirror_registry_is_self_signed %}
+      --sslKey {{ mirror_registry_fqdn | replace('.', '_') }}.key
+      --sslCert {{ mirror_registry_fqdn | replace('.', '_') }}.crt
+      {% endif %}
+    creates: "~/.ssh/quay_installer"
+
+- name: fix ssh-key in authorized_keys if missing
+  block:
+    - name: Fetch quay-installer ssh-key
+      community.crypto.openssh_keypair:
+        type: ed25519
+        path: ~/.ssh/quay_installer
+        regenerate: never
+      register: _quay_installer_key
+
+    - name: Patch quay-installer ssh-key in authorized_keys
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user | default(ansible_facts.user_id) }}"
+        key: "{{ _quay_installer_key.public_key }} {{ _quay_installer_key.comment | default('quay-installer@mirror-registry') }}"
+
+- name: mirror-registry upgrade
+  when:
+    - _quay_installer.stat.exists
+    - _mirror_registry_download is changed
+  command:
+    chdir: "~/mirror-registry"
+    cmd: >-
+      ./mirror-registry upgrade -v
+      --quayHostname {{ mirror_registry_fqdn }}
+      --quayRoot {{ mirror_registry_quayroot }}
+
+- name: patch mirror-registry config
+  lineinfile:
+    path: "{{ mirror_registry_quayroot }}/quay-config/config.yaml"
+    line: "{{ item }}"
+  loop:
+    - "CREATE_PRIVATE_REPO_ON_PUSH: false"                # make repos public on push
+    - "PROMETHEUS_PUSHGATEWAY_URL: http://localhost:9091" # fix quay metrics
+  notify: restart quay-app
+
+- name: update ssl certs
+  when: not _mirror_registry_is_self_signed
+  copy:
+    content: "{{ item.content }}"
+    dest: "~/mirror-registry/quay-install/quay-config/ssl.{{ item.ext }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - content: "{{ (mirror_registry_ssl_key | trim) ~ '\n' }}"
+      ext: key
+      mode: '0644' # I know, right!?
+    - content: "{{ (mirror_registry_ssl_crt | trim) ~ '\n' }}"
+      ext: cert
+      mode: '0644'
+  loop_control:
+    label: "ssl.{{ item.ext }}"
+  notify: restart quay-app
+
+- name: force restart of quay-app
+  meta: flush_handlers
+
+- name: open the firewall for mirror-registry
+  when: firewalld_is_running | default(true)
+  become: true
+  ansible.posix.firewalld:
+    state: enabled
+    zone: public
+    port: "{{ item }}"
+    permanent: true
+    immediate: true
+  loop:
+    - "8443/tcp"
+    - "9091/tcp"
+
+- name: check health of mirror-registry
+  uri:
+    ca_path: "{{ _mirror_registry_is_self_signed | ternary(mirror_registry_quayroot ~ '/quay-rootCA/rootCA.pem', omit) }}"
+    url: "https://{{ mirror_registry_fqdn }}:8443/health/instance"
+  register: _mirror_registry_health
+  until: _mirror_registry_health.status == 200
+  retries: 10
+
+#- assert:
+#    that: _mirror_registry_health.json.data.services[name]
+#  loop: "{{ _mirror_registry_health.json.data.services.keys() }}"
+#  loop_control:
+#    loop_var: name
+
+- name: add self-signed certificate to tooling
+  when: _mirror_registry_is_self_signed
+  copy:
+    remote_src: true
+    src: "{{ mirror_registry_quayroot }}/quay-rootCA/rootCA.pem"
+    dest: "~/.config/containers/certs.d/{{ mirror_registry_fqdn }}:8443/ca.crt"
+
+- name: assert self-signed certificate for tooling
+  file:
+    state: "{{ _mirror_registry_is_self_signed | ternary('file','absent') }}"
+    path: "~/.config/containers/certs.d/{{ mirror_registry_fqdn }}:8443/ca.crt"
+
+- name: create registry login
+  containers.podman.podman_login:
+    authfile: "{{ mirror_registry_authfile }}"
+    username: "{{ mirror_registry_user }}"
+    password: "{{ mirror_registry_password }}"
+    registry: "{{ mirror_registry_fqdn }}:8443"

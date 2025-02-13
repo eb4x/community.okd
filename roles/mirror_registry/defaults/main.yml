@@ -1,0 +1,11 @@
+---
+mirror_registry_version: v2.0.3
+mirror_registry_checksum: sha256:68314762b596075807d51c9bafc529469113be68146d318a39066a77a1b7c973
+mirror_registry_user: init
+mirror_registry_password: "{{ lookup('password', '~/.ansible/.mirror_registry_password') }}"
+mirror_registry_fqdn: "{{ ansible_facts['fqdn'] }}"
+mirror_registry_quayroot: "~/mirror-registry/quay-install"
+mirror_registry_authfile: "~/.config/containers/auth.json"
+
+# mirror_registry_ssl_key:
+# mirror_registry_ssl_crt:

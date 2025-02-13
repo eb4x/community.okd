@@ -1,0 +1,237 @@
+---
+- name: create needed directories (if missing)
+  file:
+    state: directory
+    path: "{{ item.path }}"
+    mode: "{{ item.mode | default(omit) }}"
+  loop:
+    - path: "{{ coreos_image_cache_directory }}"
+    - path: "{{ installation_directory }}"
+  tags:
+    - config
+    - install-config.yaml
+    # sudo semanage fcontext -a -t httpd_sys_content_t "/home/kni/rhcos_image_cache(/.*)?"
+    # sudo restorecon -Rv /home/kni/rhcos_image_cache/
+
+# https://docs.openshift.com/container-platform/4.12/installing/installing_bare_metal_ipi/ipi-install-installation-workflow.html#ipi-install-creating-an-rhcos-images-cache_ipi-install-installation-workflow
+- name: populate coreos_image_cache_directory
+  when: use_coreos_image_cache | default(false)
+  tags:
+    - coreos_image_cache
+  block:
+    - name: coreos print-stream-json
+      command:
+        cmd: openshift-baremetal-install coreos print-stream-json
+      changed_when: false
+      register: _coreos
+      tags:
+        - config
+
+    - name: create _coreos_meta fact
+      set_fact:
+        _coreos_meta: "{{ (_coreos.stdout | from_json).architectures.x86_64.artifacts.qemu.formats | json_query('*.disk | [0]') }}"
+      tags:
+        - config
+
+    - name: Check for decompressed qcow2 image in image cache directory
+      stat:
+        path: "{{ coreos_image_cache_directory }}/{{ coreos_meta_location | default(_coreos_meta.location) | basename | splitext | first }}"
+        checksum_algorithm: sha256
+      register: _coreos
+
+    - name: download qemu image for bootstrap
+      when:
+        - not _coreos.stat.exists or
+          _coreos.stat.checksum != coreos_meta_uncompressed_sha256 | default(_coreos_meta['uncompressed-sha256'])
+      get_url:
+        url: "{{ coreos_meta_location | default(_coreos_meta.location) }}"
+        checksum: "sha256:{{ coreos_meta_sha256 | default(_coreos_meta['sha256']) }}"
+        dest: "{{ coreos_image_cache_directory }}/{{ coreos_meta_location | default(_coreos_meta.location) | basename }}"
+        mode: '0644'
+      environment: "{{ hostvars[inventory_hostname].environment | default({}) }}"
+
+    - name: decompress gz image
+      when:
+        - not _coreos.stat.exists or
+          _coreos.stat.checksum != coreos_meta_uncompressed_sha256 | default(_coreos_meta['uncompressed-sha256'])
+        - (coreos_meta_location | default(_coreos_meta.location) | basename | splitext | last) == '.gz'
+      command:
+        argv:
+          - gunzip
+          - --decompress
+          - "{{ coreos_image_cache_directory }}/{{ _coreos_meta.location | basename }}"
+        creates: "{{ coreos_image_cache_directory }}/{{ coreos_meta_location | default(_coreos_meta.location) | basename | splitext | first }}"
+
+    - name: decompress xz image
+      when:
+        - not _coreos.stat.exists or
+          _coreos.stat.checksum != coreos_meta_uncompressed_sha256 | default(_coreos_meta['uncompressed-sha256'])
+        - (coreos_meta_location | default(_coreos_meta.location) | basename | splitext | last) == '.xz'
+      command:
+        cmd: "xz --decompress {{ coreos_image_cache_directory }}/{{ coreos_meta_location | default(_coreos_meta.location) | basename }}"
+        creates: "{{ coreos_image_cache_directory }}/{{ coreos_meta_location | default(_coreos_meta.location) | basename | splitext | first }}"
+
+- name: get mirror-registry cert
+  when: _mirror_registry_is_self_signed
+  slurp:
+    src: "{{ mirror_registry_quayroot }}/quay-rootCA/rootCA.pem"
+  register: _mirror_registry_ca
+  tags:
+    - config
+    - install-config.yaml
+
+- name: define bootstrap_os_image
+  when:
+    - coreos_meta_location is defined
+    - coreos_meta_sha256 is defined
+    - coreos_meta_uncompressed_sha256 is defined
+  set_fact:
+    bootstrap_os_image: "{{ coreos_meta_location }}?sha256={{ coreos_meta_sha256 }}"
+
+- name: "create {{ installation_directory }}/install-config.yaml"
+  template:
+    src: install-config.yaml.j2
+    dest: "{{ installation_directory }}/install-config.yaml"
+    mode: '0644'
+  vars:
+    ssh_key: "{{ _ssh_key.public_key }} {{ _ssh_key.comment }}"
+    mirror_registry_ca: "{{ _mirror_registry_ca.content | default('') | b64decode | trim }}"
+    openshift_install_version: "{{ _openshift_install_version }}"
+  tags:
+    - config
+    - install-config.yaml
+
+- name: openshift-install create manifests
+  command:
+    cmd: openshift-baremetal-install --dir {{ installation_directory }} create manifests
+    removes: "{{ installation_directory }}/install-config.yaml"
+  tags:
+    - config
+
+# https://github.com/openshift/cluster-network-operator#configuring-ipsec-with-ovnkubernetes-at-runtime
+# https://docs.openshift.com/container-platform/4.11/networking/ovn_kubernetes_network_provider/configuring-ipsec-ovn.html
+# https://docs.openshift.com/container-platform/4.11/networking/changing-cluster-network-mtu.html#mtu-value-selection_changing-cluster-network-mtu
+# https://docs.mirantis.com/mke/3.7/ops/deploy-apps-k8s/kubernetes-network-encryption.html#configure-maximum-transmission-units
+# https://www.rfc-editor.org/rfc/rfc4303#section-2.3
+- name: enable ipsec
+  copy:
+    content: |
+      ---
+      apiVersion: operator.openshift.io/v1
+      kind: Network
+      metadata:
+        name: cluster
+      spec:
+        defaultNetwork:
+          type: OVNKubernetes
+          ovnKubernetesConfig:
+            mtu: {{ 1500 - ovnkubernetes_overhead - ipsec_overhead - (1500 - ovnkubernetes_overhead - ipsec_overhead) % 8 }}
+            ipsecConfig: {% if _openshift_install_version is version('4.15', '<') %}{}{% endif %}
+              {% if _openshift_install_version is version('4.15', '>=') +%}
+              mode: External
+              {% endif %}
+    dest: "{{ installation_directory }}/manifests/cluster-network-03-config.yml"
+    mode: '0644'
+  vars:
+    ovnkubernetes_overhead: 100
+    ipsec_overhead: 46
+  tags:
+    - config
+
+- name: override ntp
+  copy:
+    content: |
+      ---
+      apiVersion: machineconfiguration.openshift.io/v1
+      kind: MachineConfig
+      metadata:
+        name: 99-{{ role }}-chrony-conf-override
+        labels:
+          machineconfiguration.openshift.io/role: {{ role }}
+      spec:
+        config:
+          ignition:
+            version: 3.2.0
+          storage:
+            files:
+              - filesystem: root
+                path: /etc/chrony.conf
+                contents:
+                  source: "data:text/plain;base64,{{ chrony_conf | b64encode }}"
+                mode: 420
+                overwrite: true
+    dest: "{{ installation_directory }}/manifests/99-{{ role }}-chrony-conf-override.yaml"
+    mode: '0644'
+  vars:
+    chrony_conf: "{{ lookup('template', 'chrony.conf.j2') }}"
+  loop: [master, worker]
+  loop_control:
+    loop_var: role
+  tags:
+    - config
+
+- name: enable mirror registries
+  when: use_mirror_registry
+  copy:
+    content: |
+      ---
+      apiVersion: config.openshift.io/v1
+      kind: {{ item.kind }}
+      metadata:
+        name: mirror-set
+      spec:
+        {{ item.spec }}:
+        {{ image_mirror_sets | to_yaml | indent(2) }}
+    dest: "{{ installation_directory }}/manifests/{{ item.dest }}"
+    mode: '0644'
+  loop:
+    - kind: ImageDigestMirrorSet
+      spec: imageDigestMirrors
+      dest: 99-image-digest-mirror-set.yaml
+    - kind: ImageTagMirrorSet
+      spec: imageTagMirrors
+      dest: 99-image-tag-mirror-set.yaml
+  tags:
+    - config
+
+- name: openshift-baremetal-install create cluster
+  command:
+    cmd: openshift-baremetal-install --dir {{ installation_directory }} create cluster
+    creates: "{{ installation_directory }}/auth/kubeconfig"
+  environment:
+    TF_LOG: trace
+  async: 7200
+  poll: 0
+  register: _create_cluster
+
+# https://github.com/okd-project/okd/discussions/1500
+- name: fix release-image-pivot.service
+  when:
+    - _openshift_install_version is version('4.13', '>=')
+    - fix_ostree_auth | default(true) | bool
+  block:
+    - name: Wait for bootstrap
+      wait_for:
+        host: 172.22.0.2
+        port: 22
+        timeout: 600
+    - name: patch rpm-ostree auth
+      command:
+        cmd: >-
+          ssh -o StrictHostKeyChecking=no core@172.22.0.2 -t
+          sudo cp /root/.docker/config.json /etc/ostree/auth.json
+
+- name: get results of openshift-baremetal-install create cluster
+  block:
+    - name: check openshift-baremetal-install process
+      async_status:
+        jid: "{{ _create_cluster.ansible_job_id }}"
+      register: _async_status
+      retries: 240
+      delay: 30
+      until: _async_status.finished
+  always:
+    - name: print results
+      debug:
+        msg: "{{ _async_status[item].split('\n') }}"
+      loop: [stdout, stderr]
